@@ -4,10 +4,15 @@ import dash_core_components as dcc
 import dash_html_components as html
 import plotly.graph_objects as go
 import dash_table
+from sqlalchemy import create_engine
+import psycopg2
 import os
 my_passwd = os.environ.get('DB_USER_PASSWORD')
 
-df = pd.read_csv('aggr.csv', parse_dates=['Entry time'])
+#df = pd.read_csv('aggr.csv', parse_dates=['Entry time'])
+
+engine = create_engine('postgresql://nps_demo_user:my_passwd@nps-demo-instance.cyjpgo7cbnay.us-east-2.rds.amazonaws.com/nps_demo_db')
+df = pd.read_sql("SELECT * from aggr", engine.connect(), parse_dates=('OCCURRED_ON_DATE',))
 
 app = dash.Dash(__name__, external_stylesheets=['https://codepen.io/uditagarwal/pen/oNvwKNP.css', 'https://codepen.io/uditagarwal/pen/YzKbqyV.css'])
 
@@ -159,13 +164,14 @@ app.layout = html.Div(children=[
     [dash.dependencies.Input('exchange-select', 'value')]
 ) 
 def update_date(value):
-    dff = df[df['Exchange'] == value]
+    dff_date = df.copy()
+    dff_date = dff_date[dff_date['Exchange'] == value]
     
-    return dff['Entry time'].min(),dff['Entry time'].max() 
+    return dff_date['Entry time'].min(),dff_date['Entry time'].max() 
 
-def filter_df(df, exchange, margin, start_date, end_date):
-    df['YearMonth'] = df['Entry time'].dt.to_period('M').dt.strftime('%Y-%m')
-    return df[(df['Exchange'] == exchange) & (df['Margin'] == margin) & (df['Entry time'] >= start_date) & (df['Entry time'] < end_date)]
+def filter_df(dff, exchange, margin, start_date, end_date):
+    dff['YearMonth'] =pd.to_datetime(dff['Entry time'].map(lambda x: "{}-{}".format(x.year, x.month)))
+    return dff[(dff['Exchange'] == exchange) & (dff['Margin'] == margin) & (dff['Entry time'] >= start_date) & (dff['Entry time'] < end_date)]
 
 def calc_returns_over_month(dff):
     out = []
@@ -182,6 +188,20 @@ def calc_returns_over_month(dff):
         })
     return out
 
+def calc_returns_over_day(dff):
+    dff['Day'] =pd.to_datetime(dff['Entry time'].map(lambda x: "{}-{}-{}".format(x.year, x.month,x.day)))
+    out = []
+    for name, group in dff.groupby('Day'):
+        exit_balance = group.head(1)['Exit balance'].values[0]
+        entry_balance = group.tail(1)['Entry balance'].values[0]
+        btc_price = group.head(1)['BTC Price'].values[0]
+        out.append({
+            'day': name,
+            'entry': entry_balance,
+            'exit': exit_balance,
+            'btc_price': btc_price
+        })
+    return out
 
 def calc_btc_returns(dff):
     btc_start_value = dff.tail(1)['BTC Price'].values[0]
@@ -211,7 +231,8 @@ def calc_strat_returns(dff):
     )
 )
 def update_monthly(exchange, leverage, start_date, end_date):
-    dff = filter_df(df, exchange, leverage, start_date, end_date)
+    df2 = df.copy()
+    dff = filter_df(df2, exchange, leverage, start_date, end_date)
     data = calc_returns_over_month(dff)
     btc_returns = calc_btc_returns(dff)
     strat_returns = calc_strat_returns(dff)
@@ -242,8 +263,9 @@ def update_monthly(exchange, leverage, start_date, end_date):
     )
 )
 def update_table(exchange, leverage, start_date, end_date):
-    dff = filter_df(df, exchange, leverage, start_date, end_date)
-    return dff.to_dict('records')  
+    dff_table = df.copy()
+    dff_table = filter_df(dff_table, exchange, leverage, start_date, end_date)
+    return dff_table.to_dict('records')  
 
 @app.callback(
     dash.dependencies.Output('pnl-types', 'figure'),
@@ -255,16 +277,25 @@ def update_table(exchange, leverage, start_date, end_date):
     )
 )
 def update_bar_chart(exchange, leverage, start_date, end_date):
-    dff = filter_df(df, exchange, leverage, start_date, end_date)
+    dff_bar = df.copy()
+    dff_bar = filter_df(dff_bar, exchange, leverage, start_date, end_date)
     
-    return {
-            'data':[
-                go.Bar(
-                    x=dff['YearMonth'],
-                    y=dff['Pnl (incl fees)']                    
-                    )
-                ]
-            } 
+    short=dff_bar[dff_bar['Trade type']=='Short']    
+    short_data = go.Bar(
+                x=short['Entry time'], 
+                y=short['Pnl (incl fees)'], 
+                name='Short' 
+                )
+    
+    long=dff_bar[dff_bar['Trade type']=='Long']
+    long_data = go.Bar(
+                x=long['Entry time'], 
+                y=long['Pnl (incl fees)'], 
+                name='Long' 
+                )
+    
+    return {'data': [short_data, long_data],
+            'layout': go.Layout(title='PnL vs Trade type',height= 500)}
 
 @app.callback(
     dash.dependencies.Output('daily-btc', 'figure'),
@@ -276,17 +307,38 @@ def update_bar_chart(exchange, leverage, start_date, end_date):
     )
 )
 def update_btc(exchange, leverage, start_date, end_date):
-    dff = filter_df(df, exchange, leverage, start_date, end_date)
-    
-    return {
-            'data':[
+    dff_btc = df.copy()
+    dff_btc = dff_btc[(dff_btc['Entry time'] >= start_date) & (dff_btc['Entry time'] < end_date)]
+    data=calc_returns_over_day(dff_btc)
+        
+    return {'data': [
                 go.Scatter(
-                    x=dff['YearMonth'],
-                    y=dff['BTC Price']                    
+                    x=[each['day'] for each in data], 
+                    y=[each['btc_price'] for each in data]
                     )
-                ]
-            } 
+                ],
+            'layout': go.Layout(title='BTC Price',height= 500)}  
 
+@app.callback(
+    dash.dependencies.Output('balance', 'figure'),
+    (
+        dash.dependencies.Input('exchange-select', 'value'),
+        dash.dependencies.Input('leverage-select', 'value'),
+        dash.dependencies.Input('date-range-select', 'start_date'),
+        dash.dependencies.Input('date-range-select', 'end_date'),
+    )
+)
+def update_balance(exchange, leverage, start_date, end_date):
+    dff_btc = df.copy()
+    dff_btc = filter_df(dff_btc, exchange, leverage, start_date, end_date)
+    
+    return {'data': [
+                go.Scatter(
+                    x=dff_btc['Entry time'],
+                    y = dff_btc['Exit balance']+dff_btc['Pnl (incl fees)']
+                    )
+                ],
+            'layout': go.Layout(title='Balance',height= 500)}  
 
 
 if __name__ == "__main__":
